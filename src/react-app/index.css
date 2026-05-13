@@ -1,0 +1,98 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 215 20% 15%;
+    --card: 0 0% 100%;
+    --card-foreground: 215 20% 15%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 215 20% 15%;
+    --primary: 200 100% 50%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 220 13% 91%;
+    --secondary-foreground: 215 20% 15%;
+    --muted: 220 13% 91%;
+    --muted-foreground: 215 16% 47%;
+    --accent: 193 100% 55%;
+    --accent-foreground: 0 0% 100%;
+    --destructive: 0 84.2% 60.2%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 220 13% 91%;
+    --input: 220 13% 91%;
+    --ring: 200 100% 50%;
+    --radius: 0.5rem;
+    --chart-1: 200 100% 50%;
+    --chart-2: 193 100% 50%;
+    --chart-3: 200 100% 45%;
+    --chart-4: 193 100% 45%;
+    --chart-5: 200 100% 40%;
+    --sidebar: 0 0% 98%;
+    --sidebar-foreground: 215 20% 15%;
+    --sidebar-primary: 200 100% 50%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 220 13% 91%;
+    --sidebar-accent-foreground: 215 20% 15%;
+    --sidebar-border: 220 13% 91%;
+    --sidebar-ring: 200 100% 50%;
+    --stadium-home: 200 100% 50%;
+    --stadium-away: 193 100% 55%;
+    --stadium-glow: 193 90% 60%;
+  }
+
+  .dark {
+    --background: 222 47% 7%;
+    --foreground: 220 13% 91%;
+    --card: 215 28% 17%;
+    --card-foreground: 220 13% 91%;
+    --popover: 215 28% 17%;
+    --popover-foreground: 220 13% 91%;
+    --primary: 200 100% 55%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 215 25% 27%;
+    --secondary-foreground: 220 13% 91%;
+    --muted: 215 25% 27%;
+    --muted-foreground: 215 16% 57%;
+    --accent: 193 100% 60%;
+    --accent-foreground: 0 0% 100%;
+    --destructive: 0 72.2% 50.6%;
+    --destructive-foreground: 220 13% 91%;
+    --border: 0 0% 100% / 10%;
+    --input: 0 0% 100% / 15%;
+    --ring: 200 100% 55%;
+    --chart-1: 200 100% 55%;
+    --chart-2: 193 100% 55%;
+    --chart-3: 200 100% 50%;
+    --chart-4: 193 100% 50%;
+    --chart-5: 200 100% 45%;
+    --sidebar: 215 28% 17%;
+    --sidebar-foreground: 220 13% 91%;
+    --sidebar-primary: 200 100% 55%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 215 25% 27%;
+    --sidebar-accent-foreground: 220 13% 91%;
+    --sidebar-border: 0 0% 100% / 10%;
+    --sidebar-ring: 200 100% 55%;
+    --stadium-home: 200 100% 55%;
+    --stadium-away: 193 100% 60%;
+    --stadium-glow: 193 90% 65%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-family: "Inter Variable", "Inter", system-ui, sans-serif;
+  }
+
+  button:not([disabled]),
+  [role="button"]:not([disabled]) {
+    cursor: pointer;
+  }
+}

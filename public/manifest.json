@@ -1,0 +1,17 @@
+{
+  "name": "ScoreLink Live",
+  "short_name": "ScoreLink",
+  "description": "Live scoreboards for youth sports - real-time game tracking",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#2563eb",
+  "icons": [
+    {
+      "src": "https://019d10b5-13db-77bf-8d2c-806760d8fabe.mochausercontent.com/scorelink-icon.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
