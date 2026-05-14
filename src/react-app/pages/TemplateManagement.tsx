@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router';
-import { useAuth } from '@getmocha/users-service/react';
+import { useAuth } from '@/react-app/hooks/useAuth';
 import { ArrowLeft, Plus, Edit, Trash2, Trophy } from 'lucide-react';
 import { Button } from '@/react-app/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/react-app/components/ui/card';

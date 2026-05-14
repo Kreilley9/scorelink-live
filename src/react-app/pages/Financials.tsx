@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { useNavigate } from "react-router";
 import { Button } from "@/react-app/components/ui/button";
 import { ArrowLeft, DollarSign, TrendingUp, Users, Calendar, LogOut } from "lucide-react";
-import { useAuth } from "@getmocha/users-service/react";
+import { useAuth } from "@/react-app/hooks/useAuth";
 import Footer from "@/react-app/components/Footer";
 
 interface FinancialData {

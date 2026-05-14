@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "019d10b5-13db-77bf-8d2c-806760d8fabe",
+  "name": "scorelink-live",
   "main": "./src/worker/index.ts",
   "compatibility_date": "2025-06-17",
   "compatibility_flags": ["nodejs_compat"],
@@ -14,14 +14,14 @@
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "019d10b5-13db-77bf-8d2c-806760d8fabe",
-      "database_id": "019d10b5-13db-77bf-8d2c-806760d8fabe"
+      "database_name": "scorelink-live",
+      "database_id": "2b430af3-77db-4ab5-9f54-036b5357b7a0"
     }
   ],
 	  "r2_buckets": [
 	    {
 	      "binding": "R2_BUCKET",
-	      "bucket_name": "019d10b5-13db-77bf-8d2c-806760d8fabe"
+	      "bucket_name": "scorelink-live"
 	    }
 	  ],
 	  "services": [
@@ -33,5 +33,9 @@
 	        "appId": "019d10b5-13db-77bf-8d2c-806760d8fabe"
 	      }
 	    }
-	  ]
+	  ],
+	  "vars": {
+	    "CLERK_PUBLISHABLE_KEY": "",
+	    "CLERK_SECRET_KEY": ""
+	  }
 	}

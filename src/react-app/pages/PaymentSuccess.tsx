@@ -128,8 +128,8 @@ export default function PaymentSuccess() {
           {/* Support */}
           <p className="text-center text-slate-500 text-sm mt-6">
             Need help getting started? Contact us at{" "}
-            <a href="mailto:support@getmocha.com" className="text-amber-400 hover:underline">
-              support@getmocha.com
+            <a href="mailto:support@scorelink.live" className="text-amber-400 hover:underline">
+              support@scorelink.live
             </a>
           </p>
         </div>

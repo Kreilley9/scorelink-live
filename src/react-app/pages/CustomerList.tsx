@@ -6,7 +6,7 @@ import { Input } from "@/react-app/components/ui/input";
 import { Label } from "@/react-app/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/react-app/components/ui/select";
 import { ArrowLeft, Search, TrendingUp, Calendar, Users, Gamepad2, LogOut, Plus, Pencil, Trash2 } from "lucide-react";
-import { useAuth } from "@getmocha/users-service/react";
+import { useAuth } from "@/react-app/hooks/useAuth";
 import Footer from "@/react-app/components/Footer";
 import { SPORTS, SportType } from "@/data/sports";
 

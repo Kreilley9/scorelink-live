@@ -222,7 +222,7 @@ export type SubscriptionTier = (typeof SubscriptionTiers)[number];
 
 export const UserSchema = z.object({
   id: z.number(),
-  mocha_user_id: z.string(),
+  clerk_user_id: z.string(),
   email: z.string(),
   role: z.enum(UserRoles),
   subscription_tier: z.enum(SubscriptionTiers).nullable().optional(),

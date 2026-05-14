@@ -1,14 +1,8 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import { getCookie, setCookie } from "hono/cookie";
+import { getCookie } from "hono/cookie";
 import { Game, UpdateGameStateSchema, ScoreboardTemplate, Branding, TierFeatures } from "@/shared/types";
-import {
-  exchangeCodeForSessionToken,
-  getOAuthRedirectUrl,
-  authMiddleware,
-  deleteSession,
-  MOCHA_SESSION_TOKEN_COOKIE_NAME,
-} from "@getmocha/users-service/backend";
+import { createClerkClient } from "@clerk/backend";
 import twilio from "twilio";
 import Stripe from "stripe";
 import OpenAI from "openai";
@@ -18,8 +12,8 @@ interface Env {
   DB: D1Database;
   R2_BUCKET: R2Bucket;
   EMAILS: any;
-  MOCHA_USERS_SERVICE_API_URL: string;
-  MOCHA_USERS_SERVICE_API_KEY: string;
+  CLERK_PUBLISHABLE_KEY: string;
+  CLERK_SECRET_KEY: string;
   TWILIO_ACCOUNT_SID: string;
   TWILIO_AUTH_TOKEN: string;
   TWILIO_PHONE_NUMBER: string;
@@ -31,58 +25,42 @@ interface Env {
   AI_OPS_CONNECTOR_SECRET: string;
 }
 
-const app = new Hono<{ Bindings: Env }>();
+const app = new Hono<{ Bindings: Env; Variables: { clerkUserId: string } }>();
 
 app.use("/*", cors());
 
-// Authentication endpoints
-app.get("/api/oauth/google/redirect_url", async (c) => {
-  const redirectUrl = await getOAuthRedirectUrl("google", {
-    apiUrl: c.env.MOCHA_USERS_SERVICE_API_URL,
-    apiKey: c.env.MOCHA_USERS_SERVICE_API_KEY,
-  });
+async function clerkAuthMiddleware(c: any, next: any) {
+  const token =
+    c.req.header("Authorization")?.replace("Bearer ", "") ??
+    getCookie(c, "__session");
 
-  return c.json({ redirectUrl }, 200);
-});
+  if (!token) return c.json({ error: "Not authenticated" }, 401);
 
-app.post("/api/sessions", async (c) => {
-  const body = await c.req.json();
-
-  if (!body.code) {
-    return c.json({ error: "No authorization code provided" }, 400);
+  try {
+    const clerk = createClerkClient({ secretKey: c.env.CLERK_SECRET_KEY });
+    const payload = await clerk.verifyToken(token);
+    c.set("clerkUserId", payload.sub);
+    await next();
+  } catch {
+    return c.json({ error: "Not authenticated" }, 401);
   }
+}
 
-  const sessionToken = await exchangeCodeForSessionToken(body.code, {
-    apiUrl: c.env.MOCHA_USERS_SERVICE_API_URL,
-    apiKey: c.env.MOCHA_USERS_SERVICE_API_KEY,
-  });
-
-  setCookie(c, MOCHA_SESSION_TOKEN_COOKIE_NAME, sessionToken, {
-    httpOnly: true,
-    path: "/",
-    sameSite: "none",
-    secure: true,
-    maxAge: 60 * 24 * 60 * 60, // 60 days
-  });
-
-  return c.json({ success: true }, 200);
-});
-
-app.get("/api/users/me", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
+app.get("/api/users/me", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   // Get or create user with role
   let user = await c.env.DB.prepare(
-    "SELECT * FROM users WHERE mocha_user_id = ?"
+    "SELECT * FROM users WHERE clerk_user_id = ?"
   )
-    .bind(mochaUser.id)
+    .bind(clerkUserId)
     .first<{
       id: number;
-      mocha_user_id: string;
+      clerk_user_id: string;
       email: string;
       role: string;
       subscription_tier: string | null;
@@ -100,21 +78,25 @@ app.get("/api/users/me", authMiddleware, async (c) => {
     // First user becomes admin with premium tier, otherwise viewer
     const userCount = await c.env.DB.prepare("SELECT COUNT(*) as count FROM users")
       .first<{ count: number }>();
-    
+
     const role = userCount && userCount.count === 0 ? "admin" : "viewer";
     const tier = userCount && userCount.count === 0 ? "premium" : null;
     const fieldsAllowed = userCount && userCount.count === 0 ? 999999 : null;
-    
+
+    const clerk = createClerkClient({ secretKey: c.env.CLERK_SECRET_KEY });
+    const clerkUser = await clerk.users.getUser(clerkUserId);
+    const userEmail = clerkUser.emailAddresses[0]?.emailAddress ?? "";
+
     await c.env.DB.prepare(
-      "INSERT INTO users (mocha_user_id, email, role, subscription_tier, fields_allowed) VALUES (?, ?, ?, ?, ?)"
+      "INSERT INTO users (clerk_user_id, email, role, subscription_tier, fields_allowed) VALUES (?, ?, ?, ?, ?)"
     )
-      .bind(mochaUser.id, mochaUser.email, role, tier, fieldsAllowed)
+      .bind(clerkUserId, userEmail, role, tier, fieldsAllowed)
       .run();
 
     user = await c.env.DB.prepare(
-      "SELECT * FROM users WHERE mocha_user_id = ?"
+      "SELECT * FROM users WHERE clerk_user_id = ?"
     )
-      .bind(mochaUser.id)
+      .bind(clerkUserId)
       .first();
   } else if (user.role === "admin" && (!user.subscription_tier || !user.fields_allowed)) {
     // Auto-upgrade existing admin accounts that don't have tier/fields set
@@ -126,9 +108,9 @@ app.get("/api/users/me", authMiddleware, async (c) => {
     
     // Refresh user data
     user = await c.env.DB.prepare(
-      "SELECT * FROM users WHERE mocha_user_id = ?"
+      "SELECT * FROM users WHERE clerk_user_id = ?"
     )
-      .bind(mochaUser.id)
+      .bind(clerkUserId)
       .first();
   }
 
@@ -145,7 +127,9 @@ app.get("/api/users/me", authMiddleware, async (c) => {
   }
 
   return c.json({
-    ...mochaUser,
+    id: user?.id,
+    clerk_user_id: clerkUserId,
+    email: user?.email,
     role: user?.role,
     subscription_tier: user?.subscription_tier,
     organization_name: user?.organization_name,
@@ -160,10 +144,10 @@ app.get("/api/users/me", authMiddleware, async (c) => {
 });
 
 // Onboarding endpoint - save user's organization and template
-app.post("/api/users/onboarding", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
+app.post("/api/users/onboarding", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
@@ -193,7 +177,7 @@ app.post("/api/users/onboarding", authMiddleware, async (c) => {
         role = CASE WHEN role = 'viewer' THEN 'coordinator' ELSE role END,
         is_onboarded = 1,
         updated_at = CURRENT_TIMESTAMP
-    WHERE mocha_user_id = ?
+    WHERE clerk_user_id = ?
   `)
     .bind(
       organization_name || null,
@@ -209,21 +193,24 @@ app.post("/api/users/onboarding", authMiddleware, async (c) => {
       state_province || null,
       country || null,
       zip_code || null,
-      mochaUser.id
+      clerkUserId
     )
     .run();
 
   // Send customer update to AI Ops (non-blocking)
   try {
+    const dbUser = await c.env.DB.prepare("SELECT email FROM users WHERE clerk_user_id = ?")
+      .bind(clerkUserId).first<{ email: string }>();
+    const fallbackEmail = dbUser?.email ?? "";
     const client = new ScoreLinkToAiOpsClient(c.env);
     await client.sendCustomerUpdate({
-      externalCustomerId: mochaUser.id,
-      name: `${first_name || ''} ${last_name || ''}`.trim() || mochaUser.email,
-      email: email || mochaUser.email,
+      externalCustomerId: clerkUserId,
+      name: `${first_name || ''} ${last_name || ''}`.trim() || fallbackEmail,
+      email: email || fallbackEmail,
       companyName: organization_name || undefined,
       planKey: 'free',
       status: 'active',
-      billingEmail: email || mochaUser.email
+      billingEmail: email || fallbackEmail
     });
   } catch (error) {
     console.error('Failed to send customer update to AI Ops:', error);
@@ -233,10 +220,10 @@ app.post("/api/users/onboarding", authMiddleware, async (c) => {
 });
 
 // Update user's template settings
-app.patch("/api/users/template", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
+app.patch("/api/users/template", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
@@ -251,11 +238,11 @@ app.patch("/api/users/template", authMiddleware, async (c) => {
     UPDATE users 
     SET template_config = ?,
         updated_at = CURRENT_TIMESTAMP
-    WHERE mocha_user_id = ?
+    WHERE clerk_user_id = ?
   `)
     .bind(
       JSON.stringify(template_config),
-      mochaUser.id
+      clerkUserId
     )
     .run();
 
@@ -263,39 +250,22 @@ app.patch("/api/users/template", authMiddleware, async (c) => {
 });
 
 app.get("/api/logout", async (c) => {
-  const sessionToken = getCookie(c, MOCHA_SESSION_TOKEN_COOKIE_NAME);
-
-  if (typeof sessionToken === "string") {
-    await deleteSession(sessionToken, {
-      apiUrl: c.env.MOCHA_USERS_SERVICE_API_URL,
-      apiKey: c.env.MOCHA_USERS_SERVICE_API_KEY,
-    });
-  }
-
-  setCookie(c, MOCHA_SESSION_TOKEN_COOKIE_NAME, "", {
-    httpOnly: true,
-    path: "/",
-    sameSite: "none",
-    secure: true,
-    maxAge: 0,
-  });
-
   return c.json({ success: true }, 200);
 });
 
 // ==================== SPORT ACCOUNTS ====================
 
 // Get all sport accounts for the current user
-app.get("/api/sport-accounts", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
-  if (!mochaUser) {
+app.get("/api/sport-accounts", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   // Get the user's internal ID
   const user = await c.env.DB.prepare(
-    "SELECT id FROM users WHERE mocha_user_id = ?"
-  ).bind(mochaUser.id).first<{ id: number }>();
+    "SELECT id FROM users WHERE clerk_user_id = ?"
+  ).bind(clerkUserId).first<{ id: number }>();
 
   if (!user) {
     return c.json([], 200);
@@ -309,15 +279,15 @@ app.get("/api/sport-accounts", authMiddleware, async (c) => {
 });
 
 // Create a new sport account
-app.post("/api/sport-accounts", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
-  if (!mochaUser) {
+app.post("/api/sport-accounts", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   const user = await c.env.DB.prepare(
-    "SELECT id FROM users WHERE mocha_user_id = ?"
-  ).bind(mochaUser.id).first<{ id: number }>();
+    "SELECT id FROM users WHERE clerk_user_id = ?"
+  ).bind(clerkUserId).first<{ id: number }>();
 
   if (!user) {
     return c.json({ error: "User not found" }, 404);
@@ -359,9 +329,9 @@ app.post("/api/sport-accounts", authMiddleware, async (c) => {
 });
 
 // Update a sport account
-app.patch("/api/sport-accounts/:id", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
-  if (!mochaUser) {
+app.patch("/api/sport-accounts/:id", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
@@ -370,8 +340,8 @@ app.patch("/api/sport-accounts/:id", authMiddleware, async (c) => {
 
   // Get user
   const user = await c.env.DB.prepare(
-    "SELECT id, role FROM users WHERE mocha_user_id = ?"
-  ).bind(mochaUser.id).first<{ id: number; role: string }>();
+    "SELECT id, role FROM users WHERE clerk_user_id = ?"
+  ).bind(clerkUserId).first<{ id: number; role: string }>();
 
   if (!user) {
     return c.json({ error: "User not found" }, 404);
@@ -441,17 +411,17 @@ app.patch("/api/sport-accounts/:id", authMiddleware, async (c) => {
 });
 
 // Delete (deactivate) a sport account
-app.delete("/api/sport-accounts/:id", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
-  if (!mochaUser) {
+app.delete("/api/sport-accounts/:id", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   const accountId = parseInt(c.req.param("id"));
 
   const user = await c.env.DB.prepare(
-    "SELECT id, role FROM users WHERE mocha_user_id = ?"
-  ).bind(mochaUser.id).first<{ id: number; role: string }>();
+    "SELECT id, role FROM users WHERE clerk_user_id = ?"
+  ).bind(clerkUserId).first<{ id: number; role: string }>();
 
   if (!user) {
     return c.json({ error: "User not found" }, 404);
@@ -503,17 +473,17 @@ app.get("/api/games/active", async (c) => {
 });
 
 // Get all games (must come before /api/games/:code to avoid route conflict)
-app.get("/api/games/all", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
+app.get("/api/games/all", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   const currentUser = await c.env.DB.prepare(
-    "SELECT id, role FROM users WHERE mocha_user_id = ?"
+    "SELECT id, role FROM users WHERE clerk_user_id = ?"
   )
-    .bind(mochaUser.id)
+    .bind(clerkUserId)
     .first<{ id: number; role: string }>();
 
   if (!currentUser || !["admin", "coordinator", "referee"].includes(currentUser.role)) {
@@ -530,7 +500,7 @@ app.get("/api/games/all", authMiddleware, async (c) => {
   // Coordinators only see their own games
   if (currentUser.role === "coordinator") {
     conditions.push("created_by_user_id = ?");
-    params.push(mochaUser.id);
+    params.push(clerkUserId);
   }
   
   // Filter by sport_account_id if provided
@@ -690,18 +660,18 @@ app.patch("/api/games/:code", async (c) => {
 });
 
 // Create a new game (requires referee or admin role)
-app.post("/api/games", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
+app.post("/api/games", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   // Check user role
   const user = await c.env.DB.prepare(
-    "SELECT role FROM users WHERE mocha_user_id = ?"
+    "SELECT role FROM users WHERE clerk_user_id = ?"
   )
-    .bind(mochaUser.id)
+    .bind(clerkUserId)
     .first<{ role: string }>();
 
   if (!user || !["admin", "coordinator", "referee"].includes(user.role)) {
@@ -734,7 +704,7 @@ app.post("/api/games", authMiddleware, async (c) => {
       2, // away_blitzes
       0, // is_running
       "active",
-      mochaUser.id, // created_by_user_id
+      clerkUserId, // created_by_user_id
       body.sport_account_id || null
     )
     .run();
@@ -749,24 +719,24 @@ app.post("/api/games", authMiddleware, async (c) => {
 });
 
 // Update user role (admin only)
-app.patch("/api/users/:mocha_user_id/role", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
+app.patch("/api/users/:clerk_user_id/role", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   const currentUser = await c.env.DB.prepare(
-    "SELECT role FROM users WHERE mocha_user_id = ?"
+    "SELECT role FROM users WHERE clerk_user_id = ?"
   )
-    .bind(mochaUser.id)
+    .bind(clerkUserId)
     .first<{ role: string }>();
 
   if (!currentUser || currentUser.role !== "admin") {
     return c.json({ error: "Admin access required" }, 403);
   }
 
-  const targetUserId = c.req.param("mocha_user_id");
+  const targetUserId = c.req.param("clerk_user_id");
   const body = await c.req.json();
   
   if (!body.role || !["admin", "coordinator", "referee", "viewer"].includes(body.role)) {
@@ -783,7 +753,7 @@ app.patch("/api/users/:mocha_user_id/role", authMiddleware, async (c) => {
     : [body.role];
 
   await c.env.DB.prepare(
-    `UPDATE users SET ${updateFields}, updated_at = CURRENT_TIMESTAMP WHERE mocha_user_id = ?`
+    `UPDATE users SET ${updateFields}, updated_at = CURRENT_TIMESTAMP WHERE clerk_user_id = ?`
   )
     .bind(...updateValues, targetUserId)
     .run();
@@ -792,24 +762,24 @@ app.patch("/api/users/:mocha_user_id/role", authMiddleware, async (c) => {
 });
 
 // Update coordinator subscription (admin only)
-app.patch("/api/users/:mocha_user_id/subscription", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
+app.patch("/api/users/:clerk_user_id/subscription", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   const currentUser = await c.env.DB.prepare(
-    "SELECT role FROM users WHERE mocha_user_id = ?"
+    "SELECT role FROM users WHERE clerk_user_id = ?"
   )
-    .bind(mochaUser.id)
+    .bind(clerkUserId)
     .first<{ role: string }>();
 
   if (!currentUser || currentUser.role !== "admin") {
     return c.json({ error: "Admin access required" }, 403);
   }
 
-  const targetUserId = c.req.param("mocha_user_id");
+  const targetUserId = c.req.param("clerk_user_id");
   const body = await c.req.json();
   
   // Validate subscription tier
@@ -825,7 +795,7 @@ app.patch("/api/users/:mocha_user_id/subscription", authMiddleware, async (c) =>
       subscription_end_date = ?, 
       fields_allowed = ?,
       updated_at = CURRENT_TIMESTAMP 
-    WHERE mocha_user_id = ?`
+    WHERE clerk_user_id = ?`
   )
     .bind(
       body.subscription_tier || null,
@@ -841,24 +811,24 @@ app.patch("/api/users/:mocha_user_id/subscription", authMiddleware, async (c) =>
 });
 
 // Edit user details (admin only)
-app.patch("/api/users/:mocha_user_id", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
+app.patch("/api/users/:clerk_user_id", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   const currentUser = await c.env.DB.prepare(
-    "SELECT role FROM users WHERE mocha_user_id = ?"
+    "SELECT role FROM users WHERE clerk_user_id = ?"
   )
-    .bind(mochaUser.id)
+    .bind(clerkUserId)
     .first<{ role: string }>();
 
   if (!currentUser || currentUser.role !== "admin") {
     return c.json({ error: "Admin access required" }, 403);
   }
 
-  const targetUserId = c.req.param("mocha_user_id");
+  const targetUserId = c.req.param("clerk_user_id");
   const body = await c.req.json();
   
   const updates: string[] = [];
@@ -897,13 +867,13 @@ app.patch("/api/users/:mocha_user_id", authMiddleware, async (c) => {
   values.push(targetUserId);
 
   await c.env.DB.prepare(
-    `UPDATE users SET ${updates.join(", ")} WHERE mocha_user_id = ?`
+    `UPDATE users SET ${updates.join(", ")} WHERE clerk_user_id = ?`
   )
     .bind(...values)
     .run();
 
   const updatedUser = await c.env.DB.prepare(
-    "SELECT * FROM users WHERE mocha_user_id = ?"
+    "SELECT * FROM users WHERE clerk_user_id = ?"
   )
     .bind(targetUserId)
     .first();
@@ -912,33 +882,33 @@ app.patch("/api/users/:mocha_user_id", authMiddleware, async (c) => {
 });
 
 // Delete user (admin only)
-app.delete("/api/users/:mocha_user_id", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
+app.delete("/api/users/:clerk_user_id", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   const currentUser = await c.env.DB.prepare(
-    "SELECT role FROM users WHERE mocha_user_id = ?"
+    "SELECT role FROM users WHERE clerk_user_id = ?"
   )
-    .bind(mochaUser.id)
+    .bind(clerkUserId)
     .first<{ role: string }>();
 
   if (!currentUser || currentUser.role !== "admin") {
     return c.json({ error: "Admin access required" }, 403);
   }
 
-  const targetUserId = c.req.param("mocha_user_id");
+  const targetUserId = c.req.param("clerk_user_id");
   
   // Prevent deleting yourself
-  if (targetUserId === mochaUser.id) {
+  if (targetUserId === clerkUserId) {
     return c.json({ error: "Cannot delete your own account" }, 400);
   }
 
   // Get user's internal ID for cascade deletes
   const userToDelete = await c.env.DB.prepare(
-    "SELECT id FROM users WHERE mocha_user_id = ?"
+    "SELECT id FROM users WHERE clerk_user_id = ?"
   )
     .bind(targetUserId)
     .first<{ id: number }>();
@@ -974,7 +944,7 @@ app.delete("/api/users/:mocha_user_id", authMiddleware, async (c) => {
     .run();
   
   // Finally delete the user
-  await c.env.DB.prepare("DELETE FROM users WHERE mocha_user_id = ?")
+  await c.env.DB.prepare("DELETE FROM users WHERE clerk_user_id = ?")
     .bind(targetUserId)
     .run();
 
@@ -982,17 +952,17 @@ app.delete("/api/users/:mocha_user_id", authMiddleware, async (c) => {
 });
 
 // List all users (admin and coordinators can see users)
-app.get("/api/users", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
+app.get("/api/users", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   const currentUser = await c.env.DB.prepare(
-    "SELECT id, role FROM users WHERE mocha_user_id = ?"
+    "SELECT id, role FROM users WHERE clerk_user_id = ?"
   )
-    .bind(mochaUser.id)
+    .bind(clerkUserId)
     .first<{ id: number; role: string }>();
 
   if (!currentUser || !["admin", "coordinator"].includes(currentUser.role)) {
@@ -1023,18 +993,18 @@ app.get("/api/users", authMiddleware, async (c) => {
 });
 
 // Create/invite a new user
-app.post("/api/users", authMiddleware, async (c) => {
+app.post("/api/users", clerkAuthMiddleware, async (c) => {
   try {
-    const mochaUser = c.get("user");
+    const clerkUserId = c.get("clerkUserId") as string;
     
-    if (!mochaUser) {
+    if (!clerkUserId) {
       return c.json({ error: "Not authenticated" }, 401);
     }
 
     const currentUser = await c.env.DB.prepare(
-      "SELECT id, role FROM users WHERE mocha_user_id = ?"
+      "SELECT id, role FROM users WHERE clerk_user_id = ?"
     )
-      .bind(mochaUser.id)
+      .bind(clerkUserId)
       .first<{ id: number; role: string }>();
 
     if (!currentUser || !["admin", "coordinator"].includes(currentUser.role)) {
@@ -1065,7 +1035,7 @@ app.post("/api/users", authMiddleware, async (c) => {
 
     // Create placeholder user (they'll complete onboarding on first login)
     const result = await c.env.DB.prepare(
-      `INSERT INTO users (mocha_user_id, email, role, is_onboarded, created_at, updated_at) 
+      `INSERT INTO users (clerk_user_id, email, role, is_onboarded, created_at, updated_at) 
        VALUES (?, ?, ?, ?, datetime('now'), datetime('now'))`
     )
       .bind(
@@ -1090,17 +1060,17 @@ app.post("/api/users", authMiddleware, async (c) => {
 });
 
 // Get user-field assignments for a user
-app.get("/api/users/:user_id/field-assignments", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
+app.get("/api/users/:user_id/field-assignments", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   const currentUser = await c.env.DB.prepare(
-    "SELECT id, role FROM users WHERE mocha_user_id = ?"
+    "SELECT id, role FROM users WHERE clerk_user_id = ?"
   )
-    .bind(mochaUser.id)
+    .bind(clerkUserId)
     .first<{ id: number; role: string }>();
 
   if (!currentUser || !["admin", "coordinator"].includes(currentUser.role)) {
@@ -1131,17 +1101,17 @@ app.get("/api/users/:user_id/field-assignments", authMiddleware, async (c) => {
 });
 
 // Assign user to field
-app.post("/api/users/:user_id/field-assignments", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
+app.post("/api/users/:user_id/field-assignments", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   const currentUser = await c.env.DB.prepare(
-    "SELECT id, role FROM users WHERE mocha_user_id = ?"
+    "SELECT id, role FROM users WHERE clerk_user_id = ?"
   )
-    .bind(mochaUser.id)
+    .bind(clerkUserId)
     .first<{ id: number; role: string }>();
 
   if (!currentUser || !["admin", "coordinator"].includes(currentUser.role)) {
@@ -1193,17 +1163,17 @@ app.post("/api/users/:user_id/field-assignments", authMiddleware, async (c) => {
 });
 
 // Remove user field assignment
-app.delete("/api/users/:user_id/field-assignments/:assignment_id", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
+app.delete("/api/users/:user_id/field-assignments/:assignment_id", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   const currentUser = await c.env.DB.prepare(
-    "SELECT id, role FROM users WHERE mocha_user_id = ?"
+    "SELECT id, role FROM users WHERE clerk_user_id = ?"
   )
-    .bind(mochaUser.id)
+    .bind(clerkUserId)
     .first<{ id: number; role: string }>();
 
   if (!currentUser || !["admin", "coordinator"].includes(currentUser.role)) {
@@ -1241,17 +1211,17 @@ app.delete("/api/users/:user_id/field-assignments/:assignment_id", authMiddlewar
 });
 
 // Get field usage statistics for current user
-app.get("/api/users/field-usage", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
+app.get("/api/users/field-usage", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   const currentUser = await c.env.DB.prepare(
-    "SELECT id, role, fields_allowed FROM users WHERE mocha_user_id = ?"
+    "SELECT id, role, fields_allowed FROM users WHERE clerk_user_id = ?"
   )
-    .bind(mochaUser.id)
+    .bind(clerkUserId)
     .first<{ id: number; role: string; fields_allowed: number }>();
 
   if (!currentUser) {
@@ -1291,17 +1261,17 @@ app.get("/api/users/field-usage", authMiddleware, async (c) => {
 });
 
 // Get completed games
-app.get("/api/games/completed", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
+app.get("/api/games/completed", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   const currentUser = await c.env.DB.prepare(
-    "SELECT id, role FROM users WHERE mocha_user_id = ?"
+    "SELECT id, role FROM users WHERE clerk_user_id = ?"
   )
-    .bind(mochaUser.id)
+    .bind(clerkUserId)
     .first<{ id: number; role: string }>();
 
   if (!currentUser || !["admin", "coordinator"].includes(currentUser.role)) {
@@ -1338,17 +1308,17 @@ app.get("/api/games/completed", authMiddleware, async (c) => {
 // Referee management endpoints
 
 // List all referees (admin only)
-app.get("/api/referees", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
+app.get("/api/referees", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   const currentUser = await c.env.DB.prepare(
-    "SELECT id, role FROM users WHERE mocha_user_id = ?"
+    "SELECT id, role FROM users WHERE clerk_user_id = ?"
   )
-    .bind(mochaUser.id)
+    .bind(clerkUserId)
     .first<{ id: number; role: string }>();
 
   if (!currentUser || !["admin", "coordinator"].includes(currentUser.role)) {
@@ -1383,17 +1353,17 @@ app.get("/api/referees", authMiddleware, async (c) => {
 });
 
 // Create referee (admin only)
-app.post("/api/referees", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
+app.post("/api/referees", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   const currentUser = await c.env.DB.prepare(
-    "SELECT id, role FROM users WHERE mocha_user_id = ?"
+    "SELECT id, role FROM users WHERE clerk_user_id = ?"
   )
-    .bind(mochaUser.id)
+    .bind(clerkUserId)
     .first<{ id: number; role: string }>();
 
   if (!currentUser || !["admin", "coordinator"].includes(currentUser.role)) {
@@ -1412,17 +1382,17 @@ app.post("/api/referees", authMiddleware, async (c) => {
 });
 
 // Update referee (admin only)
-app.patch("/api/referees/:id", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
+app.patch("/api/referees/:id", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   const currentUser = await c.env.DB.prepare(
-    "SELECT id, role FROM users WHERE mocha_user_id = ?"
+    "SELECT id, role FROM users WHERE clerk_user_id = ?"
   )
-    .bind(mochaUser.id)
+    .bind(clerkUserId)
     .first<{ id: number; role: string }>();
 
   if (!currentUser || !["admin", "coordinator"].includes(currentUser.role)) {
@@ -1456,17 +1426,17 @@ app.patch("/api/referees/:id", authMiddleware, async (c) => {
 });
 
 // Delete referee (admin only)
-app.delete("/api/referees/:id", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
+app.delete("/api/referees/:id", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   const currentUser = await c.env.DB.prepare(
-    "SELECT id, role FROM users WHERE mocha_user_id = ?"
+    "SELECT id, role FROM users WHERE clerk_user_id = ?"
   )
-    .bind(mochaUser.id)
+    .bind(clerkUserId)
     .first<{ id: number; role: string }>();
 
   if (!currentUser || !["admin", "coordinator"].includes(currentUser.role)) {
@@ -1501,17 +1471,17 @@ app.delete("/api/referees/:id", authMiddleware, async (c) => {
 // Field management endpoints
 
 // List all fields for the current user
-app.get("/api/fields", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
+app.get("/api/fields", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   const currentUser = await c.env.DB.prepare(
-    "SELECT id, role, fields_allowed FROM users WHERE mocha_user_id = ?"
+    "SELECT id, role, fields_allowed FROM users WHERE clerk_user_id = ?"
   )
-    .bind(mochaUser.id)
+    .bind(clerkUserId)
     .first<{ id: number; role: string; fields_allowed: number | null }>();
 
   if (!currentUser || !["admin", "coordinator"].includes(currentUser.role)) {
@@ -1597,17 +1567,17 @@ app.get("/api/fields", authMiddleware, async (c) => {
 });
 
 // Create a new field
-app.post("/api/fields", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
+app.post("/api/fields", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   const currentUser = await c.env.DB.prepare(
-    "SELECT id, role, fields_allowed FROM users WHERE mocha_user_id = ?"
+    "SELECT id, role, fields_allowed FROM users WHERE clerk_user_id = ?"
   )
-    .bind(mochaUser.id)
+    .bind(clerkUserId)
     .first<{ id: number; role: string; fields_allowed: number | null }>();
 
   if (!currentUser || !["admin", "coordinator"].includes(currentUser.role)) {
@@ -1663,17 +1633,17 @@ app.post("/api/fields", authMiddleware, async (c) => {
 });
 
 // Update field
-app.patch("/api/fields/:id", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
+app.patch("/api/fields/:id", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   const currentUser = await c.env.DB.prepare(
-    "SELECT id, role FROM users WHERE mocha_user_id = ?"
+    "SELECT id, role FROM users WHERE clerk_user_id = ?"
   )
-    .bind(mochaUser.id)
+    .bind(clerkUserId)
     .first<{ id: number; role: string }>();
 
   if (!currentUser || !["admin", "coordinator"].includes(currentUser.role)) {
@@ -1714,17 +1684,17 @@ app.patch("/api/fields/:id", authMiddleware, async (c) => {
 });
 
 // Delete field
-app.delete("/api/fields/:id", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
+app.delete("/api/fields/:id", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   const currentUser = await c.env.DB.prepare(
-    "SELECT id, role FROM users WHERE mocha_user_id = ?"
+    "SELECT id, role FROM users WHERE clerk_user_id = ?"
   )
-    .bind(mochaUser.id)
+    .bind(clerkUserId)
     .first<{ id: number; role: string }>();
 
   if (!currentUser || !["admin", "coordinator"].includes(currentUser.role)) {
@@ -1770,17 +1740,17 @@ app.delete("/api/fields/:id", authMiddleware, async (c) => {
 // Game scheduling endpoints
 
 // Schedule a game (admin only)
-app.post("/api/games/schedule", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
+app.post("/api/games/schedule", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   const currentUser = await c.env.DB.prepare(
-    "SELECT id, role FROM users WHERE mocha_user_id = ?"
+    "SELECT id, role FROM users WHERE clerk_user_id = ?"
   )
-    .bind(mochaUser.id)
+    .bind(clerkUserId)
     .first<{ id: number; role: string }>();
 
   if (!currentUser || !["admin", "coordinator"].includes(currentUser.role)) {
@@ -1819,7 +1789,7 @@ app.post("/api/games/schedule", authMiddleware, async (c) => {
       body.scheduled_time || null,
       body.field_location || null,
       body.assigned_referee_id || null,
-      mochaUser.id,
+      clerkUserId,
       body.division || null,
       body.clock_mode || 'running',
       body.clock_direction || 'down',
@@ -1875,7 +1845,7 @@ app.post("/api/games/schedule", authMiddleware, async (c) => {
        FROM games
        WHERE created_by_user_id = ?`
     )
-      .bind(mochaUser.id)
+      .bind(clerkUserId)
       .first<any>();
     
     const sportAccount = body.sport_account_id 
@@ -1885,7 +1855,7 @@ app.post("/api/games/schedule", authMiddleware, async (c) => {
       : null;
     
     await client.sendUsageSnapshot({
-      externalCustomerId: mochaUser.id,
+      externalCustomerId: clerkUserId,
       snapshotDate: new Date().toISOString().split('T')[0],
       activeLeaguesCount: metrics?.active_leagues || 0,
       activeEventsCount: 0,
@@ -1905,17 +1875,17 @@ app.post("/api/games/schedule", authMiddleware, async (c) => {
 });
 
 // Assign referees to a game (admin only)
-app.post("/api/games/:id/referees", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
+app.post("/api/games/:id/referees", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   const currentUser = await c.env.DB.prepare(
-    "SELECT id, role FROM users WHERE mocha_user_id = ?"
+    "SELECT id, role FROM users WHERE clerk_user_id = ?"
   )
-    .bind(mochaUser.id)
+    .bind(clerkUserId)
     .first<{ id: number; role: string }>();
 
   if (!currentUser || !["admin", "coordinator"].includes(currentUser.role)) {
@@ -1932,7 +1902,7 @@ app.post("/api/games/:id/referees", authMiddleware, async (c) => {
       .bind(gameId)
       .first<{ created_by_user_id: string | null }>();
     
-    if (!game || game.created_by_user_id !== mochaUser.id) {
+    if (!game || game.created_by_user_id !== clerkUserId) {
       return c.json({ error: "Access denied" }, 403);
     }
   }
@@ -1975,17 +1945,17 @@ app.get("/api/games/:id/referees", async (c) => {
 });
 
 // Edit/update a scheduled game (admin and coordinator only)
-app.patch("/api/games/:id", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
+app.patch("/api/games/:id", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   const currentUser = await c.env.DB.prepare(
-    "SELECT id, role FROM users WHERE mocha_user_id = ?"
+    "SELECT id, role FROM users WHERE clerk_user_id = ?"
   )
-    .bind(mochaUser.id)
+    .bind(clerkUserId)
     .first<{ id: number; role: string }>();
 
   if (!currentUser || !["admin", "coordinator"].includes(currentUser.role)) {
@@ -2105,17 +2075,17 @@ app.patch("/api/games/:id", authMiddleware, async (c) => {
 });
 
 // Delete a game (admin and coordinator only)
-app.delete("/api/games/:id", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
+app.delete("/api/games/:id", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   const currentUser = await c.env.DB.prepare(
-    "SELECT id, role FROM users WHERE mocha_user_id = ?"
+    "SELECT id, role FROM users WHERE clerk_user_id = ?"
   )
-    .bind(mochaUser.id)
+    .bind(clerkUserId)
     .first<{ id: number; role: string }>();
 
   if (!currentUser || !["admin", "coordinator"].includes(currentUser.role)) {
@@ -2346,17 +2316,17 @@ app.post("/api/games/:code/transition", async (c) => {
 // Sponsor management endpoints
 
 // List all sponsors (admin only)
-app.get("/api/sponsors", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
+app.get("/api/sponsors", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   const currentUser = await c.env.DB.prepare(
-    "SELECT id, role FROM users WHERE mocha_user_id = ?"
+    "SELECT id, role FROM users WHERE clerk_user_id = ?"
   )
-    .bind(mochaUser.id)
+    .bind(clerkUserId)
     .first<{ id: number; role: string }>();
 
   if (!currentUser || !["admin", "coordinator"].includes(currentUser.role)) {
@@ -2425,17 +2395,17 @@ app.get("/api/files/*", async (c) => {
 });
 
 // Upload sponsor logo
-app.post("/api/sponsors/upload-logo", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
+app.post("/api/sponsors/upload-logo", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   const currentUser = await c.env.DB.prepare(
-    "SELECT id, role FROM users WHERE mocha_user_id = ?"
+    "SELECT id, role FROM users WHERE clerk_user_id = ?"
   )
-    .bind(mochaUser.id)
+    .bind(clerkUserId)
     .first<{ id: number; role: string }>();
 
   if (!currentUser || !["admin", "coordinator"].includes(currentUser.role)) {
@@ -2488,17 +2458,17 @@ app.post("/api/sponsors/upload-logo", authMiddleware, async (c) => {
 });
 
 // Create sponsor (admin only)
-app.post("/api/sponsors", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
+app.post("/api/sponsors", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   const currentUser = await c.env.DB.prepare(
-    "SELECT id, role FROM users WHERE mocha_user_id = ?"
+    "SELECT id, role FROM users WHERE clerk_user_id = ?"
   )
-    .bind(mochaUser.id)
+    .bind(clerkUserId)
     .first<{ id: number; role: string }>();
 
   if (!currentUser || !["admin", "coordinator"].includes(currentUser.role)) {
@@ -2523,17 +2493,17 @@ app.post("/api/sponsors", authMiddleware, async (c) => {
 });
 
 // Update sponsor (admin only)
-app.patch("/api/sponsors/:id", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
+app.patch("/api/sponsors/:id", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   const currentUser = await c.env.DB.prepare(
-    "SELECT id, role FROM users WHERE mocha_user_id = ?"
+    "SELECT id, role FROM users WHERE clerk_user_id = ?"
   )
-    .bind(mochaUser.id)
+    .bind(clerkUserId)
     .first<{ id: number; role: string }>();
 
   if (!currentUser || !["admin", "coordinator"].includes(currentUser.role)) {
@@ -2574,17 +2544,17 @@ app.patch("/api/sponsors/:id", authMiddleware, async (c) => {
 });
 
 // Delete sponsor (admin only)
-app.delete("/api/sponsors/:id", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
+app.delete("/api/sponsors/:id", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   const currentUser = await c.env.DB.prepare(
-    "SELECT id, role FROM users WHERE mocha_user_id = ?"
+    "SELECT id, role FROM users WHERE clerk_user_id = ?"
   )
-    .bind(mochaUser.id)
+    .bind(clerkUserId)
     .first<{ id: number; role: string }>();
 
   if (!currentUser || !["admin", "coordinator"].includes(currentUser.role)) {
@@ -2617,17 +2587,17 @@ app.delete("/api/sponsors/:id", authMiddleware, async (c) => {
 });
 
 // Assign sponsor to game (admin only)
-app.post("/api/games/:gameId/sponsors/:sponsorId", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
+app.post("/api/games/:gameId/sponsors/:sponsorId", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   const currentUser = await c.env.DB.prepare(
-    "SELECT role FROM users WHERE mocha_user_id = ?"
+    "SELECT role FROM users WHERE clerk_user_id = ?"
   )
-    .bind(mochaUser.id)
+    .bind(clerkUserId)
     .first<{ role: string }>();
 
   if (!currentUser || currentUser.role !== "admin") {
@@ -2673,17 +2643,17 @@ app.get("/api/games/:code/sponsors", async (c) => {
 });
 
 // Send SMS link to referee (admin only)
-app.post("/api/games/:id/send-referee-link", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
+app.post("/api/games/:id/send-referee-link", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   const currentUser = await c.env.DB.prepare(
-    "SELECT role FROM users WHERE mocha_user_id = ?"
+    "SELECT role FROM users WHERE clerk_user_id = ?"
   )
-    .bind(mochaUser.id)
+    .bind(clerkUserId)
     .first<{ role: string }>();
 
   if (!currentUser || currentUser.role !== "admin") {
@@ -2751,10 +2721,10 @@ app.post("/api/games/:id/send-referee-link", authMiddleware, async (c) => {
 // Template management endpoints
 
 // Get all templates
-app.get("/api/templates", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
+app.get("/api/templates", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
@@ -2766,17 +2736,17 @@ app.get("/api/templates", authMiddleware, async (c) => {
 });
 
 // Create template (admin only)
-app.post("/api/templates", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
+app.post("/api/templates", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   const currentUser = await c.env.DB.prepare(
-    "SELECT role FROM users WHERE mocha_user_id = ?"
+    "SELECT role FROM users WHERE clerk_user_id = ?"
   )
-    .bind(mochaUser.id)
+    .bind(clerkUserId)
     .first<{ role: string }>();
 
   if (!currentUser || currentUser.role !== "admin") {
@@ -2824,17 +2794,17 @@ app.post("/api/templates", authMiddleware, async (c) => {
 });
 
 // Update template (admin only)
-app.put("/api/templates/:id", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
+app.put("/api/templates/:id", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   const currentUser = await c.env.DB.prepare(
-    "SELECT role FROM users WHERE mocha_user_id = ?"
+    "SELECT role FROM users WHERE clerk_user_id = ?"
   )
-    .bind(mochaUser.id)
+    .bind(clerkUserId)
     .first<{ role: string }>();
 
   if (!currentUser || currentUser.role !== "admin") {
@@ -2885,17 +2855,17 @@ app.put("/api/templates/:id", authMiddleware, async (c) => {
 });
 
 // Delete template (admin only)
-app.delete("/api/templates/:id", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
+app.delete("/api/templates/:id", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   const currentUser = await c.env.DB.prepare(
-    "SELECT role FROM users WHERE mocha_user_id = ?"
+    "SELECT role FROM users WHERE clerk_user_id = ?"
   )
-    .bind(mochaUser.id)
+    .bind(clerkUserId)
     .first<{ role: string }>();
 
   if (!currentUser || currentUser.role !== "admin") {
@@ -2915,17 +2885,17 @@ app.delete("/api/templates/:id", authMiddleware, async (c) => {
 });
 
 // Update template (admin only)
-app.patch("/api/templates/:id", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
+app.patch("/api/templates/:id", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   const currentUser = await c.env.DB.prepare(
-    "SELECT role FROM users WHERE mocha_user_id = ?"
+    "SELECT role FROM users WHERE clerk_user_id = ?"
   )
-    .bind(mochaUser.id)
+    .bind(clerkUserId)
     .first<{ role: string }>();
 
   if (!currentUser || currentUser.role !== "admin") {
@@ -2971,17 +2941,17 @@ app.patch("/api/templates/:id", authMiddleware, async (c) => {
 // Branding management endpoints
 
 // Upload branding logo
-app.post("/api/brandings/upload-logo", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
+app.post("/api/brandings/upload-logo", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   const currentUser = await c.env.DB.prepare(
-    "SELECT id, role FROM users WHERE mocha_user_id = ?"
+    "SELECT id, role FROM users WHERE clerk_user_id = ?"
   )
-    .bind(mochaUser.id)
+    .bind(clerkUserId)
     .first<{ id: number; role: string }>();
 
   if (!currentUser || !["admin", "coordinator"].includes(currentUser.role)) {
@@ -3034,17 +3004,17 @@ app.post("/api/brandings/upload-logo", authMiddleware, async (c) => {
 });
 
 // Get all brandings
-app.get("/api/brandings", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
+app.get("/api/brandings", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   const currentUser = await c.env.DB.prepare(
-    "SELECT id, role FROM users WHERE mocha_user_id = ?"
+    "SELECT id, role FROM users WHERE clerk_user_id = ?"
   )
-    .bind(mochaUser.id)
+    .bind(clerkUserId)
     .first<{ id: number; role: string }>();
 
   if (!currentUser || !["admin", "coordinator"].includes(currentUser.role)) {
@@ -3096,17 +3066,17 @@ app.get("/api/brandings/:id", async (c) => {
 });
 
 // Create branding (admin only)
-app.post("/api/brandings", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
+app.post("/api/brandings", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   const currentUser = await c.env.DB.prepare(
-    "SELECT id, role FROM users WHERE mocha_user_id = ?"
+    "SELECT id, role FROM users WHERE clerk_user_id = ?"
   )
-    .bind(mochaUser.id)
+    .bind(clerkUserId)
     .first<{ id: number; role: string }>();
 
   if (!currentUser || !["admin", "coordinator"].includes(currentUser.role)) {
@@ -3129,7 +3099,7 @@ app.post("/api/brandings", authMiddleware, async (c) => {
       body.background_color || '#0f172a',
       body.text_color || '#ffffff',
       body.accent_color || '#fbbf24',
-      mochaUser.id,
+      clerkUserId,
       currentUser.role === "coordinator" ? currentUser.id : null,
       body.sport_account_id || null
     )
@@ -3148,17 +3118,17 @@ app.post("/api/brandings", authMiddleware, async (c) => {
 
 // Get customer list with subscription and activity data
 // Admin customer management endpoints
-app.get("/api/admin/customers", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
+app.get("/api/admin/customers", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   const currentUser = await c.env.DB.prepare(
-    "SELECT role FROM users WHERE mocha_user_id = ?"
+    "SELECT role FROM users WHERE clerk_user_id = ?"
   )
-    .bind(mochaUser.id)
+    .bind(clerkUserId)
     .first<{ role: string }>();
 
   if (!currentUser || currentUser.role !== "admin") {
@@ -3218,17 +3188,17 @@ app.get("/api/admin/customers", authMiddleware, async (c) => {
   return c.json(customersWithAccounts);
 });
 
-app.post("/api/admin/customers", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
+app.post("/api/admin/customers", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   const currentUser = await c.env.DB.prepare(
-    "SELECT role FROM users WHERE mocha_user_id = ?"
+    "SELECT role FROM users WHERE clerk_user_id = ?"
   )
-    .bind(mochaUser.id)
+    .bind(clerkUserId)
     .first<{ role: string }>();
 
   if (!currentUser || currentUser.role !== "admin") {
@@ -3301,17 +3271,17 @@ app.post("/api/admin/customers", authMiddleware, async (c) => {
   return c.json({ success: true, userId });
 });
 
-app.patch("/api/admin/customers/:id", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
+app.patch("/api/admin/customers/:id", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   const currentUser = await c.env.DB.prepare(
-    "SELECT role FROM users WHERE mocha_user_id = ?"
+    "SELECT role FROM users WHERE clerk_user_id = ?"
   )
-    .bind(mochaUser.id)
+    .bind(clerkUserId)
     .first<{ role: string }>();
 
   if (!currentUser || currentUser.role !== "admin") {
@@ -3365,17 +3335,17 @@ app.patch("/api/admin/customers/:id", authMiddleware, async (c) => {
   return c.json({ success: true });
 });
 
-app.delete("/api/admin/customers/:id", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
+app.delete("/api/admin/customers/:id", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   const currentUser = await c.env.DB.prepare(
-    "SELECT role FROM users WHERE mocha_user_id = ?"
+    "SELECT role FROM users WHERE clerk_user_id = ?"
   )
-    .bind(mochaUser.id)
+    .bind(clerkUserId)
     .first<{ role: string }>();
 
   if (!currentUser || currentUser.role !== "admin") {
@@ -3412,18 +3382,18 @@ app.delete("/api/admin/customers/:id", authMiddleware, async (c) => {
 });
 
 // Legacy analytics endpoint (kept for backwards compatibility)
-app.get("/api/analytics/customers", authMiddleware, async (c) => {
+app.get("/api/analytics/customers", clerkAuthMiddleware, async (c) => {
   // Redirect to new endpoint
-  const mochaUser = c.get("user");
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   const currentUser = await c.env.DB.prepare(
-    "SELECT role FROM users WHERE mocha_user_id = ?"
+    "SELECT role FROM users WHERE clerk_user_id = ?"
   )
-    .bind(mochaUser.id)
+    .bind(clerkUserId)
     .first<{ role: string }>();
 
   if (!currentUser || currentUser.role !== "admin") {
@@ -3459,17 +3429,17 @@ app.get("/api/analytics/customers", authMiddleware, async (c) => {
 });
 
 // Get financial analytics
-app.get("/api/analytics/financials", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
+app.get("/api/analytics/financials", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   const currentUser = await c.env.DB.prepare(
-    "SELECT role FROM users WHERE mocha_user_id = ?"
+    "SELECT role FROM users WHERE clerk_user_id = ?"
   )
-    .bind(mochaUser.id)
+    .bind(clerkUserId)
     .first<{ role: string }>();
 
   if (!currentUser || currentUser.role !== "admin") {
@@ -3529,17 +3499,17 @@ app.get("/api/analytics/financials", authMiddleware, async (c) => {
 });
 
 // Get usage statistics
-app.get("/api/analytics/statistics", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
+app.get("/api/analytics/statistics", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   const currentUser = await c.env.DB.prepare(
-    "SELECT role FROM users WHERE mocha_user_id = ?"
+    "SELECT role FROM users WHERE clerk_user_id = ?"
   )
-    .bind(mochaUser.id)
+    .bind(clerkUserId)
     .first<{ role: string }>();
 
   if (!currentUser || currentUser.role !== "admin") {
@@ -3600,17 +3570,17 @@ app.get("/api/analytics/statistics", authMiddleware, async (c) => {
 });
 
 // Update branding (admin only)
-app.put("/api/brandings/:id", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
+app.put("/api/brandings/:id", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   const currentUser = await c.env.DB.prepare(
-    "SELECT id, role FROM users WHERE mocha_user_id = ?"
+    "SELECT id, role FROM users WHERE clerk_user_id = ?"
   )
-    .bind(mochaUser.id)
+    .bind(clerkUserId)
     .first<{ id: number; role: string }>();
 
   if (!currentUser || !["admin", "coordinator"].includes(currentUser.role)) {
@@ -3663,17 +3633,17 @@ app.put("/api/brandings/:id", authMiddleware, async (c) => {
 });
 
 // Update branding
-app.patch("/api/brandings/:id", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
+app.patch("/api/brandings/:id", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   const currentUser = await c.env.DB.prepare(
-    "SELECT id, role FROM users WHERE mocha_user_id = ?"
+    "SELECT id, role FROM users WHERE clerk_user_id = ?"
   )
-    .bind(mochaUser.id)
+    .bind(clerkUserId)
     .first<{ id: number; role: string }>();
 
   if (!currentUser || !["admin", "coordinator"].includes(currentUser.role)) {
@@ -3726,17 +3696,17 @@ app.patch("/api/brandings/:id", authMiddleware, async (c) => {
 });
 
 // Delete branding (admin only)
-app.delete("/api/brandings/:id", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
+app.delete("/api/brandings/:id", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   const currentUser = await c.env.DB.prepare(
-    "SELECT id, role FROM users WHERE mocha_user_id = ?"
+    "SELECT id, role FROM users WHERE clerk_user_id = ?"
   )
-    .bind(mochaUser.id)
+    .bind(clerkUserId)
     .first<{ id: number; role: string }>();
 
   if (!currentUser || !["admin", "coordinator"].includes(currentUser.role)) {
@@ -3770,17 +3740,17 @@ app.delete("/api/brandings/:id", authMiddleware, async (c) => {
 });
 
 // Stripe checkout session creation
-app.post("/api/stripe/create-checkout-session", authMiddleware, async (c) => {
-  const mochaUser = c.get("user");
+app.post("/api/stripe/create-checkout-session", clerkAuthMiddleware, async (c) => {
+  const clerkUserId = c.get("clerkUserId") as string;
   
-  if (!mochaUser) {
+  if (!clerkUserId) {
     return c.json({ error: "Not authenticated" }, 401);
   }
 
   const currentUser = await c.env.DB.prepare(
-    "SELECT id, role, email, organization_name FROM users WHERE mocha_user_id = ?"
+    "SELECT id, role, email, organization_name FROM users WHERE clerk_user_id = ?"
   )
-    .bind(mochaUser.id)
+    .bind(clerkUserId)
     .first<{ id: number; role: string; email: string; organization_name: string | null }>();
 
   if (!currentUser) {
@@ -3987,7 +3957,7 @@ app.post("/api/webhooks/stripe", async (c) => {
         if (user) {
           const client = new ScoreLinkToAiOpsClient(c.env);
           await client.sendCustomerUpdate({
-            externalCustomerId: user.mocha_user_id,
+            externalCustomerId: user.clerk_user_id,
             name: `${user.first_name || ''} ${user.last_name || ''}`.trim() || user.email,
             email: user.contact_email || user.email,
             companyName: user.organization_name || undefined,

@@ -3,7 +3,7 @@ import { useNavigate } from "react-router";
 import { Button } from "@/react-app/components/ui/button";
 import { ArrowLeft, Trophy, Users, TrendingUp, Activity, LogOut } from "lucide-react";
 import { SportIcon } from "@/react-app/utils/sportIcons";
-import { useAuth } from "@getmocha/users-service/react";
+import { useAuth } from "@/react-app/hooks/useAuth";
 import Footer from "@/react-app/components/Footer";
 
 interface StatisticsData {

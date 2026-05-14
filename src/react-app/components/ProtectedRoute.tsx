@@ -1,6 +1,6 @@
 import { ReactNode } from "react";
 import { useNavigate } from "react-router";
-import { useAuth } from "@getmocha/users-service/react";
+import { useAuth } from "@/react-app/hooks/useAuth";
 import { useCurrentUser } from "@/react-app/hooks/useCurrentUser";
 import { Button } from "@/react-app/components/ui/button";
 import { LogIn, Lock, ArrowLeft } from "lucide-react";

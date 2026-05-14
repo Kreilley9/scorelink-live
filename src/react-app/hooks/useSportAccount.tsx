@@ -1,5 +1,6 @@
 import { createContext, useContext, useState, useEffect, ReactNode } from 'react';
 import { useCurrentUser } from './useCurrentUser';
+import { useApiFetch } from './useApiFetch';
 
 export interface SportAccount {
   id: number;
@@ -31,6 +32,7 @@ const ACTIVE_SPORT_ACCOUNT_KEY = 'scorelink_active_sport_account_id';
 
 export function SportAccountProvider({ children }: { children: ReactNode }) {
   const { currentUser, isLoading: userLoading } = useCurrentUser();
+  const apiFetch = useApiFetch();
   const [sportAccounts, setSportAccounts] = useState<SportAccount[]>([]);
   const [activeSportAccount, setActiveSportAccountState] = useState<SportAccount | null>(null);
   const [isLoading, setIsLoading] = useState(true);
@@ -44,7 +46,7 @@ export function SportAccountProvider({ children }: { children: ReactNode }) {
     }
 
     try {
-      const response = await fetch('/api/sport-accounts');
+      const response = await apiFetch('/api/sport-accounts');
       if (response.ok) {
         const accounts: SportAccount[] = await response.json();
         setSportAccounts(accounts);

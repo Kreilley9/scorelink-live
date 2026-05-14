@@ -1,6 +1,6 @@
 import { useEffect } from 'react';
 import { useNavigate } from 'react-router';
-import { useAuth } from '@getmocha/users-service/react';
+import { useAuth } from '@/react-app/hooks/useAuth';
 import { Button } from '@/react-app/components/ui/button';
 import { 
   QrCode, 

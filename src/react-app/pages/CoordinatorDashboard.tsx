@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { useNavigate } from "react-router";
 import { Button } from "@/react-app/components/ui/button";
 import { useCurrentUser } from "@/react-app/hooks/useCurrentUser";
-import { useAuth } from "@getmocha/users-service/react";
+import { useAuth } from "@/react-app/hooks/useAuth";
 import { useSportAccount } from "@/react-app/hooks/useSportAccount";
 import MultiFieldQRCode from "@/react-app/components/MultiFieldQRCode";
 import Footer from "@/react-app/components/Footer";
@@ -442,7 +442,7 @@ export default function CoordinatorDashboard() {
 
         {/* Multi-Field QR Code Dialog */}
         <MultiFieldQRCode
-          coordinatorId={currentUser?.mocha_user_id}
+          coordinatorId={currentUser?.clerk_user_id}
           eventName={activeSportAccount?.organization_name || undefined}
           open={showMultiFieldQR}
           onOpenChange={setShowMultiFieldQR}

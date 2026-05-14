@@ -1,10 +1,11 @@
 import { useState, useEffect, useCallback } from "react";
-import { useAuth } from "@getmocha/users-service/react";
+import { useAuth } from "@/react-app/hooks/useAuth";
+import { useApiFetch } from "@/react-app/hooks/useApiFetch";
 import type { UserRole, SubscriptionTier } from "@/shared/types";
 
 export interface CurrentUser {
   id: number;
-  mocha_user_id: string;
+  clerk_user_id: string;
   email: string;
   role: UserRole;
   subscription_tier: SubscriptionTier | null;
@@ -17,6 +18,7 @@ export interface CurrentUser {
 
 export function useCurrentUser() {
   const { user, isPending: authPending } = useAuth();
+  const apiFetch = useApiFetch();
   const [currentUser, setCurrentUser] = useState<CurrentUser | null>(null);
   const [isLoading, setIsLoading] = useState(true);
 
@@ -28,7 +30,7 @@ export function useCurrentUser() {
     }
 
     try {
-      const response = await fetch("/api/users/me");
+      const response = await apiFetch("/api/users/me");
       if (response.ok) {
         const data = await response.json();
         setCurrentUser(data);
@@ -41,7 +43,7 @@ export function useCurrentUser() {
     } finally {
       setIsLoading(false);
     }
-  }, [user]);
+  }, [user, apiFetch]);
 
   useEffect(() => {
     if (!authPending) {

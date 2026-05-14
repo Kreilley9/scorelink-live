@@ -21,7 +21,7 @@ interface SubscriptionDialogProps {
   onClose: () => void;
   user: {
     id: number;
-    mocha_user_id: string;
+    clerk_user_id: string;
     email: string;
     organization_name?: string | null;
     subscription_tier?: string | null;
@@ -49,7 +49,7 @@ export function SubscriptionDialog({ isOpen, onClose, user, onSave }: Subscripti
   const handleSave = async () => {
     setSaving(true);
     try {
-      await onSave(user.mocha_user_id, {
+      await onSave(user.clerk_user_id, {
         organization_name: organizationName,
         subscription_tier: tier,
         fields_allowed: parseInt(fieldsAllowed),

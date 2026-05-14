@@ -1,4 +1,4 @@
-import { useAuth } from "@getmocha/users-service/react";
+import { useAuth } from "@/react-app/hooks/useAuth";
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router";
 import { Button } from "@/react-app/components/ui/button";
@@ -30,7 +30,7 @@ import { Settings, UserPlus, X, Mail, Pencil, Trash2 } from "lucide-react";
 
 interface User {
   id: number;
-  mocha_user_id: string;
+  clerk_user_id: string;
   email: string;
   role: string;
   subscription_tier?: string | null;
@@ -148,7 +148,7 @@ export default function UserManagement() {
 
       if (response.ok) {
         setUsers(users.map(u => 
-          u.mocha_user_id === userId ? { ...u, role: newRole } : u
+          u.clerk_user_id === userId ? { ...u, role: newRole } : u
         ));
       }
     } catch (error) {
@@ -167,7 +167,7 @@ export default function UserManagement() {
       if (response.ok) {
         const updatedUser = await response.json();
         setUsers(users.map(u => 
-          u.mocha_user_id === userId ? { ...u, ...updatedUser } : u
+          u.clerk_user_id === userId ? { ...u, ...updatedUser } : u
         ));
       }
     } catch (error) {
@@ -288,7 +288,7 @@ export default function UserManagement() {
     }
     
     try {
-      const response = await fetch(`/api/users/${editingUser.mocha_user_id}`, {
+      const response = await fetch(`/api/users/${editingUser.clerk_user_id}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -305,7 +305,7 @@ export default function UserManagement() {
       
       const updatedUser = await response.json();
       setUsers(users.map(u => 
-        u.mocha_user_id === editingUser.mocha_user_id ? updatedUser : u
+        u.clerk_user_id === editingUser.clerk_user_id ? updatedUser : u
       ));
       setEditDialogOpen(false);
       setEditingUser(null);
@@ -324,7 +324,7 @@ export default function UserManagement() {
     if (!userToDelete) return;
     
     try {
-      const response = await fetch(`/api/users/${userToDelete.mocha_user_id}`, {
+      const response = await fetch(`/api/users/${userToDelete.clerk_user_id}`, {
         method: "DELETE",
       });
       
@@ -334,7 +334,7 @@ export default function UserManagement() {
         return;
       }
       
-      setUsers(users.filter(u => u.mocha_user_id !== userToDelete.mocha_user_id));
+      setUsers(users.filter(u => u.clerk_user_id !== userToDelete.clerk_user_id));
       setDeleteDialogOpen(false);
       setUserToDelete(null);
     } catch (error) {
@@ -429,8 +429,8 @@ export default function UserManagement() {
                     <div className="flex items-center gap-2 flex-wrap">
                       <Select
                         value={u.role}
-                        onValueChange={(value) => handleRoleChange(u.mocha_user_id, value)}
-                        disabled={currentUser?.id === u.mocha_user_id}
+                        onValueChange={(value) => handleRoleChange(u.clerk_user_id, value)}
+                        disabled={currentUser?.id === u.clerk_user_id}
                       >
                         <SelectTrigger className="w-32 min-h-[44px]">
                           <SelectValue />
@@ -453,7 +453,7 @@ export default function UserManagement() {
                           >
                             <Pencil className="w-4 h-4" />
                           </Button>
-                          {currentUser?.id !== u.mocha_user_id && (
+                          {currentUser?.id !== u.clerk_user_id && (
                             <Button
                               onClick={() => openDeleteDialog(u)}
                               variant="ghost"

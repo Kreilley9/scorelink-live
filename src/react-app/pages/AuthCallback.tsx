@@ -1,26 +1,25 @@
 import { useEffect } from "react";
 import { useNavigate } from "react-router";
-import { useAuth } from "@getmocha/users-service/react";
+import { useAuth } from "@/react-app/hooks/useAuth";
+import { useApiFetch } from "@/react-app/hooks/useApiFetch";
 
 export default function AuthCallback() {
-  const { exchangeCodeForSessionToken } = useAuth();
+  const { isPending } = useAuth();
+  const apiFetch = useApiFetch();
   const navigate = useNavigate();
 
   useEffect(() => {
+    if (isPending) return;
+
     const handleAuth = async () => {
       try {
-        await exchangeCodeForSessionToken();
-        
-        // Fetch user role to determine redirect
-        const response = await fetch("/api/users/me");
+        const response = await apiFetch("/api/users/me");
         if (response.ok) {
           const userData = await response.json();
-          
-          // New users (except admin) need to complete onboarding
+
           if (!userData.is_onboarded && userData.role !== "admin") {
             navigate("/onboarding");
           } else if (userData.role === "admin" || userData.role === "coordinator") {
-            // Admins and coordinators go to dashboard
             navigate("/dashboard");
           } else {
             navigate("/");
@@ -35,7 +34,7 @@ export default function AuthCallback() {
     };
 
     handleAuth();
-  }, [exchangeCodeForSessionToken, navigate]);
+  }, [isPending, apiFetch, navigate]);
 
   return (
     <div className="min-h-screen bg-slate-950 flex items-center justify-center">

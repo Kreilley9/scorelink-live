@@ -1,5 +1,6 @@
+import { useEffect, type ReactNode } from "react";
 import { BrowserRouter as Router, Routes, Route } from "react-router";
-import { AuthProvider } from "@getmocha/users-service/react";
+import { ClerkProvider, useAuth } from "@clerk/clerk-react";
 import { SportAccountProvider } from "@/react-app/hooks/useSportAccount";
 import { ProtectedRoute } from "@/react-app/components/ProtectedRoute";
 import Scoreboard from "@/react-app/pages/Scoreboard";
@@ -35,9 +36,42 @@ import OpsTicketDetail from "@/react-app/pages/OpsTicketDetail";
 import OpsFinance from "@/react-app/pages/OpsFinance";
 import OpsApprovals from "@/react-app/pages/OpsApprovals";
 
+function ClerkFetchInterceptor({ children }: { children: ReactNode }) {
+  const { getToken } = useAuth();
+
+  useEffect(() => {
+    const originalFetch = window.fetch.bind(window);
+    window.fetch = async (input: RequestInfo | URL, init: RequestInit = {}) => {
+      const url =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+          ? input.toString()
+          : (input as Request).url;
+      if (url.startsWith("/api/")) {
+        const token = await getToken();
+        if (token) {
+          const headers = new Headers(init.headers);
+          if (!headers.has("Authorization")) {
+            headers.set("Authorization", `Bearer ${token}`);
+          }
+          init = { ...init, headers };
+        }
+      }
+      return originalFetch(input, init);
+    };
+    return () => {
+      window.fetch = originalFetch;
+    };
+  }, [getToken]);
+
+  return <>{children}</>;
+}
+
 export default function App() {
   return (
-    <AuthProvider>
+    <ClerkProvider publishableKey={import.meta.env.VITE_CLERK_PUBLISHABLE_KEY}>
+      <ClerkFetchInterceptor>
       <SportAccountProvider>
       <Router>
         <Routes>
@@ -155,6 +189,7 @@ export default function App() {
         </Routes>
       </Router>
       </SportAccountProvider>
-    </AuthProvider>
+      </ClerkFetchInterceptor>
+    </ClerkProvider>
   );
 }
