@@ -11,7 +11,7 @@ import { ScoreLinkToAiOpsClient } from "./scorelinkToAiOpsClient";
 interface Env {
   DB: D1Database;
   R2_BUCKET: R2Bucket;
-  EMAILS: any;
+  RESEND_API_KEY: string;
   CLERK_PUBLISHABLE_KEY: string;
   CLERK_SECRET_KEY: string;
   TWILIO_ACCOUNT_SID: string;
@@ -28,6 +28,38 @@ interface Env {
 const app = new Hono<{ Bindings: Env; Variables: { clerkUserId: string } }>();
 
 app.use("/*", cors());
+
+async function sendEmail(apiKey: string, opts: {
+  from?: string;
+  to: string;
+  subject: string;
+  html?: string;
+  text?: string;
+  reply_to?: string;
+}): Promise<{ success: boolean; message_id?: string; error?: string }> {
+  try {
+    const res = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        from: opts.from ?? "ScoreLink <noreply@scorelinksports.com>",
+        to: [opts.to],
+        subject: opts.subject,
+        ...(opts.html ? { html: opts.html } : {}),
+        ...(opts.text ? { text: opts.text } : {}),
+        ...(opts.reply_to ? { reply_to: opts.reply_to } : {}),
+      }),
+    });
+    if (!res.ok) {
+      const err = await res.json<{ message?: string }>().catch(() => ({}));
+      return { success: false, error: err.message ?? `HTTP ${res.status}` };
+    }
+    const data = await res.json<{ id: string }>();
+    return { success: true, message_id: data.id };
+  } catch (e: any) {
+    return { success: false, error: e?.message ?? "Unknown error" };
+  }
+}
 
 async function clerkAuthMiddleware(c: any, next: any) {
   const token =
@@ -4038,11 +4070,11 @@ This message was sent from the ScoreLink LIVE contact form.
     `.trim();
 
     // Send email
-    const result = await c.env.EMAILS.send({
+    const result = await sendEmail(c.env.RESEND_API_KEY, {
       to: "reilley.kevin@gmail.com",
       subject: `ScoreLink Contact Form: ${topic} - ${name}`,
-      html_body: emailBody,
-      text_body: textBody,
+      html: emailBody,
+      text: textBody,
       reply_to: email
     });
 
@@ -4947,15 +4979,15 @@ Generate a draft response with risk assessment.`;
 
       const draftId = draftResult.meta.last_row_id as number;
 
-      // Step 6: Send email using env.EMAILS (production-ready, no dev restrictions)
+      // Step 6: Send email via Resend
       let providerMessageId: string | null = null;
       let sendError: string | null = null;
 
       try {
-        const emailResult = await c.env.EMAILS.send({
+        const emailResult = await sendEmail(c.env.RESEND_API_KEY, {
           to: ticket.customer_email,
           subject: `Re: ${ticket.subject}`,
-          text_body: aiResponse.draft,
+          text: aiResponse.draft,
         });
 
         console.log('Email service response:', JSON.stringify(emailResult));
@@ -5675,7 +5707,7 @@ app.post("/api/ops/support/tickets/:ticketId/send", async (c) => {
     // Send email
     let emailResult;
     try {
-      emailResult = await c.env.EMAILS.send({
+      emailResult = await sendEmail(c.env.RESEND_API_KEY, {
         from: "support@scorelinksports.com",
         to: draft.email,
         subject: "Re: Support Request",
@@ -5796,7 +5828,7 @@ app.post("/api/ops/approvals/:approvalId/approve", async (c) => {
 
       if (draft) {
         try {
-          const emailResult = await c.env.EMAILS.send({
+          const emailResult = await sendEmail(c.env.RESEND_API_KEY, {
             from: "support@scorelinksports.com",
             to: draft.email,
             subject: "Re: Support Request",
@@ -6146,7 +6178,7 @@ ${failedWorkflows.results.map((w: any) => `- ${w.workflow_name}: ${w.error_messa
 
     // Send email
     try {
-      await c.env.EMAILS.send({
+      await sendEmail(c.env.RESEND_API_KEY, {
         from: "aiops@scorelinksports.com",
         to: adminEmail,
         subject: `ScoreLink AI Ops Daily Summary - ${summaryDate}`,
